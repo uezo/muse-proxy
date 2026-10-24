@@ -5,6 +5,8 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -291,7 +293,14 @@ async def test_unicode_line_separators_remain_valid_sse_and_single_line_logs(tmp
         (b'{"messages": "malformed-body-never-log"', 1024, 400, "invalid_json"),
         (b'{"messages": NaN}', 1024, 400, "invalid_json"),
         (b"oversized-body-never-log" * 10, 32, 413, "body_too_large"),
-        (b"[" * 1500 + b"0" + b"]" * 1500, 4096, 400, "invalid_json"),
+        # A complete deep array can decode successfully on newer Python versions.
+        pytest.param(
+            b"[" * 1500 + b"0" + b"]" * 1499,
+            4096,
+            400,
+            "invalid_json",
+            id="incomplete-deep-array",
+        ),
     ],
 )
 async def test_unparseable_requests_log_only_omission_marker(
@@ -303,6 +312,23 @@ async def test_unparseable_requests_log_only_omission_marker(
     assert bodies(caplog, "http.request.body") == [{"omitted": reason}]
     assert "malformed-body-never-log" not in caplog.text
     assert "oversized-body-never-log" not in caplog.text
+    assert not backend.calls
+
+
+async def test_decoder_recursion_error_logs_only_invalid_json_marker(tmp_path, caplog, monkeypatch):
+    decoder = Mock(side_effect=RecursionError("decoder-private-detail-never-log"))
+    # Replace only the app's decoder reference; TRACE and HTTP clients still use real JSON.
+    monkeypatch.setattr("muse_proxy.app.json", SimpleNamespace(loads=decoder, dumps=json.dumps))
+    raw = json.dumps(payload(metadata="raw-body-private-detail-never-log")).encode()
+    async with proxy(tmp_path) as (http, _, backend):
+        response = await http.post("/v1/chat/completions", content=raw)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request_error"
+    decoder.assert_called_once()
+    assert bodies(caplog, "http.request.body") == [{"omitted": "invalid_json"}]
+    assert bodies(caplog) == [response.json()]
+    assert "decoder-private-detail-never-log" not in caplog.text
+    assert "raw-body-private-detail-never-log" not in caplog.text
     assert not backend.calls
 
 
