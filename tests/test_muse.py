@@ -429,13 +429,13 @@ async def test_repeated_request_cancellation_keeps_lock_until_refresh_finishes(c
     await asyncio.sleep(0)
     try:
         assert not task.done()
-        assert client._lock.locked()
+        assert client._store._refresh_lock.locked()
         assert not harness.sent
     finally:
         release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert not client._lock.locked()
+    assert not client._session_gates
     assert json.loads(path.read_text())["refresh_token"] == "rotated-refresh"
     await client.close()
 
@@ -729,7 +729,7 @@ async def test_cold_side_chat_repeated_404_times_out_and_cancels_single_submissi
     assert harness.sent == [("Hi", SIDE_1, "text")]
     assert harness.send_finished.is_set()
     assert harness.send_cancelled
-    assert not client._lock.locked()
+    assert not client._session_gates
     assert_closed(harness)
 
 
@@ -765,7 +765,7 @@ async def test_progress_is_available_while_waiting_and_final_reply_closes_upstre
         assert_closed(harness)
     finally:
         await stream.aclose()
-    assert not client._lock.locked()
+    assert not client._session_gates
 
 
 @pytest.mark.asyncio
@@ -823,7 +823,7 @@ async def test_native_task_cancel_is_one_terminal_event_and_drops_partial_reply(
         MuseMessage("cancel"),
     ]
     assert_closed(harness)
-    assert not client._lock.locked()
+    assert not client._session_gates
 
 
 @pytest.mark.asyncio
@@ -928,7 +928,7 @@ async def test_closing_progress_stream_cleans_up_and_does_not_send_remote_cancel
     assert (await anext(stream)).kind == "progress"
     await stream.aclose()
     assert_closed(harness)
-    assert not client._lock.locked()
+    assert not client._session_gates
     assert harness.sent == [("Hi", None, "text")]
 
 
@@ -943,7 +943,7 @@ async def test_timeout_after_progress_cleans_up_and_does_not_report_cancel(confi
         await anext(stream)
     assert caught.value.code == "muse_timeout"
     assert_closed(harness)
-    assert not client._lock.locked()
+    assert not client._session_gates
 
 
 @pytest.mark.asyncio
@@ -1198,22 +1198,15 @@ async def test_routed_root_task_id_can_be_reused_and_old_messages_are_filtered(r
 
 
 @pytest.mark.asyncio
-async def test_routed_sessions_are_isolated_and_share_one_account_connection_at_a_time(routed):
+async def test_routed_sessions_use_independent_connections_before_either_completes(routed):
     settings, harness = routed
     client = MuseClient(settings)
     first = asyncio.create_task(route_collect(client, "A", "request-a", SIDE_1))
     await wait_until(lambda: len(harness.sent) == 1)
+    first_link = harness.sessions[0]
     second = asyncio.create_task(route_collect(client, "B", "request-b", SIDE_2))
-    await asyncio.sleep(0.02)
-    assert len(harness.sent) == 1
-    await push(
-        harness,
-        event("task.status", session=SIDE_1, parent=None, task_id="root", status="running"),
-        reply("A", parent=None, session=SIDE_1),
-        terminal(parent=None, session=SIDE_1, task_id="root"),
-    )
-    assert [item.text for item in await first] == ["A"]
     await wait_until(lambda: len(harness.sent) == 2)
+    assert first_link.connected and harness.sessions[1].connected
     await push(
         harness,
         event("task.status", session=SIDE_2, parent=None, task_id="root", status="running"),
@@ -1221,7 +1214,16 @@ async def test_routed_sessions_are_isolated_and_share_one_account_connection_at_
         terminal(parent=None, session=SIDE_2, task_id="root"),
     )
     assert [item.text for item in await second] == ["B"]
+    assert not first.done()
+    for item in (
+        event("task.status", session=SIDE_1, parent=None, task_id="root", status="running"),
+        reply("A", parent=None, session=SIDE_1),
+        terminal(parent=None, session=SIDE_1, task_id="root"),
+    ):
+        first_link.queue.put_nowait(item)
+    assert [item.text for item in await first] == ["A"]
     assert_closed(harness)
+    assert not client._session_gates
 
 
 @pytest.mark.asyncio

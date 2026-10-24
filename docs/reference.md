@@ -128,6 +128,26 @@ The same user message is not resent to create the chat.
 Use these side chats exclusively for the proxy. The proxy subscribes to messages for the corresponding session.
 Different `session_id` values do not separate the Muse account or persona being used.
 
+<a id="session-id-reuse"></a>
+
+### Deleted Chats and Session ID Reuse
+
+Muse may refuse reuse of a session ID whose chat was deleted.
+In an observed case, subscription returned HTTP 404 with `session not found`, and message submission returned HTTP 404 with `chat no longer exists`.
+The proxy reported `muse_request_error`; changing the session label allowed a new chat to be created successfully.
+Deletion of the original chat is the suspected cause, rather than a confirmed rule about Muse's server behavior.
+
+If this happens, choose a new session label or an unused UUID.
+When the request omits `session_id`, change `default_session_id` in `proxy.toml`, for example:
+
+```toml
+default_session_id = "muse-proxy-1"
+```
+
+Restart the proxy after changing the configuration.
+Restarting without changing the label does not help select a new chat: the same device identity and label still produce the same UUID.
+If the request explicitly supplies `session_id`, change that value instead; it takes precedence over `default_session_id`.
+
 <a id="message-metadata"></a>
 
 ## 🏷️ Message Metadata
@@ -201,7 +221,8 @@ If the content of an already-emitted ID changes, the proxy ends with `muse_proto
 Within the same session, another request can be sent to Muse before the previous request receives a reply.
 Requests share a connection and subscription, and are recorded in the order that Muse's send API acknowledges them.
 An HTTP request's arrival alone does not make it the latest accepted request.
-Connections for different sessions are serialized within the same account.
+Different sessions use independent connections and can send messages before other sessions finish replying.
+Credential refresh is serialized within the proxy; reply waits do not hold an account-wide lock.
 
 Replies are assigned according to these rules:
 
@@ -458,7 +479,8 @@ and preflight requests return 405. CORS and additional API routes are not enable
 ### Process and connection state
 
 The CLI runs one process with one worker. Do not use the same credentials concurrently in multiple processes or workers.
-Request-to-reply associations live in process memory, and token refresh is coordinated with connections for the same account.
+Request-to-reply associations live in process memory. Within one process, credential reload, refresh, and saving are serialized;
+connections for different sessions can run concurrently. A replacement connection for the same session waits for the old connection's cleanup to finish.
 There is no persistent request/reply queue or stream resumption across restarts.
 For external access, choose an appropriate listening address and deploy an HTTPS reverse proxy.
 
