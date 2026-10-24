@@ -78,7 +78,7 @@ class _Waiter:
 
 
 class _ChatRouter:
-    """Serialize account connections, while accepting overlapping sends on this chat."""
+    """Share a connection within one chat and isolate its lifecycle from other chats."""
 
     def __init__(self, client: Any, session_id: str | None):
         self.client = client
@@ -148,7 +148,11 @@ class _ChatRouter:
         waiter.messages.clear()
         waiter.bytes = 0
         self._wake()
-        if not any(item.live for item in self.waiters) and self.task is not None:
+        if (
+            not self.closing
+            and not any(item.live for item in self.waiters)
+            and self.task is not None
+        ):
             self.task.cancel()
 
     async def _consume(self, events: Any) -> None:
@@ -472,112 +476,19 @@ class _ChatRouter:
             await self._run()
 
     async def _run(self) -> None:
-        from .muse import _load_sdk, _refuse_command, _RequestTurn
+        from .muse import _join_task
 
         error: ProxyError | None = None
-        acquired = False
         try:
-            self._phase("waiting_account_lock")
-            await self.client._lock.acquire()
-            acquired = True
-            if self.client._closed:
-                raise ProxyError(
-                    "Muse proxy is shutting down.", status_code=503, code="muse_unavailable"
-                )
-            self._phase("credentials_load")
-            self.credentials = await self.client._store.load()
-            self.sdk = _load_sdk()
-            self._phase("vm_lookup")
-            vm, self.credentials = await self.client._vm(self.sdk, self.credentials)
-            device = self.sdk.DeviceDescription(
-                node_id=self.credentials.node_id,
-                display_name="Muse OpenAI Proxy",
-                version=self.sdk.version,
-                commands={},
-            )
-            self.session = self.sdk.LinkSession(
-                noise_host=self.credentials.noise_host,
-                vm_id=vm.get("vm_id") or vm["vm_name"],
-                vm_auth_token=vm["vm_auth_token"],
-                device=device,
-                run_command=_refuse_command,
-            )
-            if self.trace is not None:
-                self.trace.credentials(self.credentials)
-                self.trace.add_secrets(vm.get("vm_auth_token"))
-                instrument_session(self.session, self.trace)
-            if self.session_id:
-                self.scope = self.client._replay_scopes.get(self.session_id)
-                if self.scope is None:
-                    self.scope = self.sdk.ReplayScope()
-                    self.client._replay_scopes[self.session_id] = self.scope
-                # Muse reuses the root agent's task ID across otherwise separate turns.
-                self.scope.ids = {item for item in self.scope.ids if item[0] == "message"}
-                self.scope.order = deque(item for item in self.scope.order if item[0] == "message")
-                self.client._replay_scopes.move_to_end(self.session_id)
-                while len(self.client._replay_scopes) > 32:
-                    self.client._replay_scopes.popitem(last=False)
-                self.turn = self.sdk.MuseTurn(
-                    self.session_id, owns_chat=True, replay_scope=self.scope
-                )
-            else:
-                self.turn = self.sdk.MuseTurn(None)
-            self.guard = _RequestTurn(self.turn)
-            self._phase("transport_connect_register")
-            self.connection = asyncio.create_task(self.session.run(self.stop))
-            await self.client._ready(self.session.registered, self.connection)
-            try:
-                await self._open_subscription()
-            except ConnectionError as exc:
-                if not self.session_id or getattr(exc, "status", None) != 404:
-                    raise
-                self._phase("create_new_chat")
-                self._start_send()
-                expires = (
-                    asyncio.get_running_loop().time() + self.client.settings.connect_timeout_seconds
-                )
-                while True:
-                    if self.submission is not None and self.submission.done():
-                        response = self.submission.result()
-                        if not isinstance(response, dict) or response.get("ok") is not True:
-                            await self._acknowledge()
-                            raise ProxyError(
-                                "Muse refused the chat request.", code="muse_request_error"
-                            ) from None
-                    if asyncio.get_running_loop().time() >= expires:
-                        raise ProxyError(
-                            "Timed out opening the Muse chat.", status_code=504, code="muse_timeout"
-                        ) from None
-                    try:
-                        await self._open_subscription()
-                        break
-                    except ConnectionError as retry:
-                        if getattr(retry, "status", None) != 404:
-                            raise
-                        await asyncio.sleep(0.05)
-            self._phase("waiting_replies")
-            while any(item.live for item in self.waiters):
-                await self._acknowledge()
-                self._start_send()
-                if self._complete():
-                    break
-                if self.connection.done():
-                    raise self.client._connection_error(self.connection)
-                if self.subscription.done():
-                    self.subscription.result()
-                    raise ProxyError(
-                        "Muse closed the chat subscription before finishing.",
-                        code="muse_connection_error",
-                    )
+            self._phase("waiting_session_lock")
+            async with self.client._session_scope(self.session_id):
                 try:
-                    item = await asyncio.wait_for(self.inbox.get(), timeout=0.01)
-                except TimeoutError:
-                    continue
-                if item is not None:
-                    if self.submission is not None:
-                        self._hold(item)
-                    else:
-                        self._feed(item[1], item[0])
+                    await self._serve()
+                finally:
+                    self.closing = True
+                    # Own cleanup independently so request/shutdown cancellation cannot
+                    # abandon the transport or release this session before retirement.
+                    await _join_task(asyncio.create_task(self._cleanup()))
         except asyncio.CancelledError:
             raise
         except ProxyError as exc:
@@ -596,27 +507,6 @@ class _ChatRouter:
             error = ProxyError("Muse communication failed.", code="muse_connection_error")
         finally:
             self.closing = True
-            tasks = [task for task in (self.subscription, self.submission) if task is not None]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.wait(tasks, timeout=1.0)
-            self.stop.set()
-            if self.connection is not None:
-                self.connection.cancel()
-                await asyncio.gather(self.connection, *tasks, return_exceptions=True)
-            if self.iterator is not None:
-                with suppress(Exception):
-                    await self.iterator.aclose()
-            if self.turn is not None:
-                self.turn.retire()
-                if self.scope is not None:
-                    self.scope.ids = {item for item in self.scope.ids if item[0] == "message"}
-                    self.scope.order = deque(
-                        item for item in self.scope.order if item[0] == "message"
-                    )
-            if acquired:
-                self.client._lock.release()
             if self.client._routers.get(self.session_id) is self:
                 self.client._routers.pop(self.session_id, None)
             for waiter in self.waiters:
@@ -642,3 +532,121 @@ class _ChatRouter:
                     )
             self.closed.set()
             self._phase("closed")
+
+    async def _serve(self) -> None:
+        from .muse import _load_sdk, _refuse_command, _RequestTurn
+
+        if self.client._closed:
+            raise ProxyError(
+                "Muse proxy is shutting down.", status_code=503, code="muse_unavailable"
+            )
+        self._phase("credentials_load")
+        self.credentials = await self.client._store.load()
+        self.sdk = _load_sdk()
+        self._phase("vm_lookup")
+        vm, self.credentials = await self.client._vm(self.sdk, self.credentials)
+        device = self.sdk.DeviceDescription(
+            node_id=self.credentials.node_id,
+            display_name="Muse OpenAI Proxy",
+            version=self.sdk.version,
+            commands={},
+        )
+        self.session = self.sdk.LinkSession(
+            noise_host=self.credentials.noise_host,
+            vm_id=vm.get("vm_id") or vm["vm_name"],
+            vm_auth_token=vm["vm_auth_token"],
+            device=device,
+            run_command=_refuse_command,
+        )
+        if self.trace is not None:
+            self.trace.credentials(self.credentials)
+            self.trace.add_secrets(vm.get("vm_auth_token"))
+            instrument_session(self.session, self.trace)
+        if self.session_id:
+            self.scope = self.client._replay_scopes.get(self.session_id)
+            if self.scope is None:
+                self.scope = self.sdk.ReplayScope()
+                self.client._replay_scopes[self.session_id] = self.scope
+            # Muse reuses the root agent's task ID across otherwise separate turns.
+            self.scope.ids = {item for item in self.scope.ids if item[0] == "message"}
+            self.scope.order = deque(item for item in self.scope.order if item[0] == "message")
+            self.client._replay_scopes.move_to_end(self.session_id)
+            self.client._trim_replay_scopes()
+            self.turn = self.sdk.MuseTurn(self.session_id, owns_chat=True, replay_scope=self.scope)
+        else:
+            self.turn = self.sdk.MuseTurn(None)
+        self.guard = _RequestTurn(self.turn)
+        self._phase("transport_connect_register")
+        self.connection = asyncio.create_task(self.session.run(self.stop))
+        await self.client._ready(self.session.registered, self.connection)
+        try:
+            await self._open_subscription()
+        except ConnectionError as exc:
+            if not self.session_id or getattr(exc, "status", None) != 404:
+                raise
+            self._phase("create_new_chat")
+            self._start_send()
+            expires = (
+                asyncio.get_running_loop().time() + self.client.settings.connect_timeout_seconds
+            )
+            while True:
+                if self.submission is not None and self.submission.done():
+                    response = self.submission.result()
+                    if not isinstance(response, dict) or response.get("ok") is not True:
+                        await self._acknowledge()
+                        raise ProxyError(
+                            "Muse refused the chat request.", code="muse_request_error"
+                        ) from None
+                if asyncio.get_running_loop().time() >= expires:
+                    raise ProxyError(
+                        "Timed out opening the Muse chat.", status_code=504, code="muse_timeout"
+                    ) from None
+                try:
+                    await self._open_subscription()
+                    break
+                except ConnectionError as retry:
+                    if getattr(retry, "status", None) != 404:
+                        raise
+                    await asyncio.sleep(0.05)
+        self._phase("waiting_replies")
+        while any(item.live for item in self.waiters):
+            await self._acknowledge()
+            self._start_send()
+            if self._complete():
+                break
+            if self.connection.done():
+                raise self.client._connection_error(self.connection)
+            if self.subscription.done():
+                self.subscription.result()
+                raise ProxyError(
+                    "Muse closed the chat subscription before finishing.",
+                    code="muse_connection_error",
+                )
+            try:
+                item = await asyncio.wait_for(self.inbox.get(), timeout=0.01)
+            except TimeoutError:
+                continue
+            if item is not None:
+                if self.submission is not None:
+                    self._hold(item)
+                else:
+                    self._feed(item[1], item[0])
+
+    async def _cleanup(self) -> None:
+        tasks = [task for task in (self.subscription, self.submission) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=1.0)
+        self.stop.set()
+        if self.connection is not None:
+            self.connection.cancel()
+            await asyncio.gather(self.connection, *tasks, return_exceptions=True)
+        if self.iterator is not None:
+            with suppress(Exception):
+                await self.iterator.aclose()
+        if self.turn is not None:
+            self.turn.retire()
+            if self.scope is not None:
+                self.scope.ids = {item for item in self.scope.ids if item[0] == "message"}
+                self.scope.order = deque(item for item in self.scope.order if item[0] == "message")

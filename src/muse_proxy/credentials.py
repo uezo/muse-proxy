@@ -142,6 +142,7 @@ class CredentialStore:
     def __init__(self, state_dir: Path, sdk_token: str | None = None):
         self.directory = state_dir
         self._sdk_token = sdk_token
+        self._refresh_lock = asyncio.Lock()
 
     async def load(self) -> Credentials:
         credentials = await asyncio.to_thread(_load, self.directory, self._sdk_token)
@@ -151,6 +152,21 @@ class CredentialStore:
 
     async def refresh(
         self, credentials: Credentials, api: Any, *, force: bool = False
+    ) -> Credentials:
+        async with self._refresh_lock:
+            latest = await self.load()
+            if force and any(
+                latest.pairing[key] != credentials.pairing[key]
+                for key in ("access_token", "refresh_token")
+            ):
+                # Another session already refreshed the token that this caller used.
+                return latest
+            if latest == credentials:
+                latest = credentials
+            return await self._refresh_current(latest, api, force=force)
+
+    async def _refresh_current(
+        self, credentials: Credentials, api: Any, *, force: bool
     ) -> Credentials:
         if (
             not force
@@ -231,7 +247,7 @@ class CredentialStore:
                 try:
                     await asyncio.shield(rotation)
                 except asyncio.CancelledError:
-                    # Repeated shutdown cancellation must not release the caller's lock
+                    # Repeated shutdown cancellation must not release the refresh lock
                     # while this worker can still rotate and replace credentials.
                     continue
                 except Exception:

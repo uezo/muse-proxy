@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
-from contextlib import aclosing, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from types import SimpleNamespace
 from typing import Any
 
@@ -55,6 +55,29 @@ def _chat_session_id(node_id: str, label: str) -> str:
         return str(uuid.UUID(label))
     except ValueError:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"muse-proxy/{node_id}/{label}"))
+
+
+async def _join_task(task: asyncio.Task) -> Any:
+    """Finish owned cleanup before propagating even repeated caller cancellation."""
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            break
+    if cancelled is not None:
+        with suppress(Exception, asyncio.CancelledError):
+            task.result()
+        raise cancelled
+    return task.result()
+
+
+class _SessionGate:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.users = 0
 
 
 class _RequestTurn:
@@ -239,11 +262,42 @@ class MuseClient:
     def __init__(self, settings: Any):
         self.settings = settings
         self._store = CredentialStore(settings.state_dir, settings.sdk_token)
-        self._lock = asyncio.Lock()
+        self._session_gates: dict[str | None, _SessionGate] = {}
         self._closed = False
         self._active: set[asyncio.Task] = set()
         self._replay_scopes: OrderedDict[str, Any] = OrderedDict()
         self._routers: dict[str | None, Any] = {}
+
+    @asynccontextmanager
+    async def _session_scope(
+        self, session_id: str | None, *, wait_seconds: float | None = None
+    ) -> AsyncIterator[None]:
+        gate = self._session_gates.get(session_id)
+        if gate is None:
+            gate = self._session_gates[session_id] = _SessionGate()
+        # Count queued users too, so a third caller cannot create a separate gate.
+        gate.users += 1
+        acquired = False
+        try:
+            async with asyncio.timeout(wait_seconds):
+                await gate.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                gate.lock.release()
+            gate.users -= 1
+            if not gate.users:
+                self._session_gates.pop(session_id, None)
+            self._trim_replay_scopes()
+
+    def _trim_replay_scopes(self) -> None:
+        for session_id in list(self._replay_scopes):
+            if len(self._replay_scopes) <= 32:
+                break
+            # Active or queued sessions must retain their replay history.
+            if session_id not in self._session_gates:
+                self._replay_scopes.pop(session_id, None)
 
     async def close(self) -> None:
         self._closed = True
@@ -343,7 +397,6 @@ class MuseClient:
         if owner is not None:
             self._active.add(owner)
         deadline = asyncio.get_running_loop().time() + self.settings.request_timeout_seconds
-        acquired = False
         trace = current_trace()
         if trace is None and logging.getLogger("muse_proxy.upstream").isEnabledFor(TRACE_LEVEL):
             trace = MuseTrace(
@@ -351,42 +404,40 @@ class MuseClient:
                 secrets=(getattr(self.settings, "api_key", None), self.settings.sdk_token),
             )
         try:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError
-            await asyncio.wait_for(self._lock.acquire(), timeout=remaining)
-            acquired = True
             if self._closed:
                 raise ProxyError(
                     "Muse proxy is shutting down.", status_code=503, code="muse_unavailable"
                 )
             effective_session = session_id or getattr(self.settings, "default_session_id", None)
-            async with aclosing(self._request_events(text, effective_session)) as reply:
-                while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        raise TimeoutError
-                    with trace_context(trace):
-                        pending = asyncio.create_task(anext(reply))
-                    try:
-                        chunk = await asyncio.wait_for(pending, timeout=remaining)
-                    except StopAsyncIteration:
-                        return
-                    except asyncio.CancelledError as cancelled:
-                        pending.cancel()
-                        while not pending.done():
-                            try:
-                                await asyncio.shield(pending)
-                            except asyncio.CancelledError:
-                                continue
-                            except Exception:
-                                break
-                        if not pending.cancelled():
-                            with suppress(Exception):
-                                pending.result()
-                        raise cancelled
-                    # No timeout context spans this yield: backpressure belongs to the caller.
-                    yield chunk
+            if effective_session:
+                credentials = await self._store.load()
+                effective_session = _chat_session_id(credentials.node_id, effective_session)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError
+            async with self._session_scope(effective_session, wait_seconds=remaining):
+                if self._closed:
+                    raise ProxyError(
+                        "Muse proxy is shutting down.", status_code=503, code="muse_unavailable"
+                    )
+                async with aclosing(self._request_events(text, effective_session)) as reply:
+                    while True:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        with trace_context(trace):
+                            pending = asyncio.create_task(anext(reply))
+                        try:
+                            chunk = await asyncio.wait_for(pending, timeout=remaining)
+                        except StopAsyncIteration:
+                            return
+                        except asyncio.CancelledError as cancelled:
+                            pending.cancel()
+                            with suppress(Exception, asyncio.CancelledError):
+                                await _join_task(pending)
+                            raise cancelled
+                        # No timeout context spans this yield: backpressure belongs to the caller.
+                        yield chunk
         except TimeoutError:
             raise ProxyError(
                 "Timed out waiting for Muse.", status_code=504, code="muse_timeout"
@@ -399,8 +450,6 @@ class MuseClient:
             # SDK/network exceptions can contain token-bearing URLs or response content.
             raise ProxyError("Muse communication failed.", code="muse_connection_error") from None
         finally:
-            if acquired:
-                self._lock.release()
             if owner is not None:
                 self._active.discard(owner)
 
@@ -551,8 +600,7 @@ class MuseClient:
                 scope = sdk.ReplayScope()
                 self._replay_scopes[session_id] = scope
             self._replay_scopes.move_to_end(session_id)
-            while len(self._replay_scopes) > 32:
-                self._replay_scopes.popitem(last=False)
+            self._trim_replay_scopes()
             parser = sdk.MuseTurn(session_id, owns_chat=True, replay_scope=scope)
         else:
             parser = sdk.MuseTurn(None)
@@ -581,6 +629,22 @@ class MuseClient:
                 subscription = None
                 iterator = None
                 raise
+
+        async def cleanup() -> None:
+            tasks = [task for task in (subscription, submission) if task is not None]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                # Let stream resets reach Muse before closing the transport. If a send is
+                # stuck, closing the connection below releases it without an endless join.
+                await asyncio.wait(tasks, timeout=1.0)
+            stop.set()
+            connection.cancel()
+            await asyncio.gather(connection, *tasks, return_exceptions=True)
+            if iterator is not None:
+                with suppress(Exception):
+                    await iterator.aclose()
+            turn.turn.retire()
 
         try:
             await self._ready(session.registered, connection)
@@ -664,20 +728,7 @@ class MuseClient:
                     {connection, subscription}, timeout=0.05, return_when=asyncio.FIRST_COMPLETED
                 )
         finally:
-            tasks = [task for task in (subscription, submission) if task is not None]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                # Let stream resets reach Muse before closing the transport. If a send is
-                # stuck, closing the connection below releases it without an endless join.
-                await asyncio.wait(tasks, timeout=1.0)
-            stop.set()
-            connection.cancel()
-            await asyncio.gather(connection, *tasks, return_exceptions=True)
-            if iterator is not None:
-                with suppress(Exception):
-                    await iterator.aclose()
-            turn.turn.retire()
+            await _join_task(asyncio.create_task(cleanup()))
         # Close upstream resources before exposing final text to a potentially slow consumer.
         for chunk in chunks:
             yield chunk

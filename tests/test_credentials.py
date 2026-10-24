@@ -135,6 +135,54 @@ async def test_fresh_token_not_refreshed_unless_forced(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_expired_snapshots_refresh_once(tmp_path):
+    state(tmp_path, access_token_saved_at=0)
+    store = CredentialStore(tmp_path, SDK_TOKEN)
+    first_snapshot, second_snapshot = await asyncio.gather(store.load(), store.load())
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def refresh(*args):
+        calls.append(args)
+        started.set()
+        release.wait(timeout=2)
+        return {"access_token": "new-access", "refresh_token": "new-refresh"}, 200
+
+    api = SimpleNamespace(refresh_device_token=refresh)
+    first = asyncio.create_task(store.refresh(first_snapshot, api))
+    assert await asyncio.to_thread(started.wait, 1)
+    second = asyncio.create_task(store.refresh(second_snapshot, api))
+    try:
+        await asyncio.sleep(0)
+        assert not second.done()
+        assert len(calls) == 1
+    finally:
+        release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == second_result
+    assert second_result.pairing["refresh_token"] == "new-refresh"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_forced_refresh_of_stale_snapshot_reuses_latest_tokens(tmp_path):
+    state(tmp_path)
+    store = CredentialStore(tmp_path, SDK_TOKEN)
+    snapshot = await store.load()
+    calls = []
+
+    def refresh(*args):
+        calls.append(args)
+        return {"access_token": "new-access", "refresh_token": "new-refresh"}, 200
+
+    api = SimpleNamespace(refresh_device_token=refresh)
+    updated = await store.refresh(snapshot, api, force=True)
+    assert await store.refresh(snapshot, api, force=True) == updated
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [401, 500, None])
 async def test_rejected_refresh_preserves_state(tmp_path, status):
     state(tmp_path, access_token_saved_at=0)
@@ -144,6 +192,25 @@ async def test_rejected_refresh_preserves_state(tmp_path, status):
     with pytest.raises(ProxyError):
         await store.refresh(await store.load(), api)
     assert (tmp_path / "pairing.json").read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_refresh_lock_released_after_error(tmp_path):
+    state(tmp_path, access_token_saved_at=0)
+    store = CredentialStore(tmp_path, SDK_TOKEN)
+    credentials = await store.load()
+    rejected_api = SimpleNamespace(refresh_device_token=lambda *args: (None, 500))
+    with pytest.raises(ProxyError):
+        await store.refresh(credentials, rejected_api)
+
+    working_api = SimpleNamespace(
+        refresh_device_token=lambda *args: (
+            {"access_token": "new-access", "refresh_token": "new-refresh"},
+            200,
+        )
+    )
+    updated = await asyncio.wait_for(store.refresh(credentials, working_api), timeout=1)
+    assert updated.pairing["refresh_token"] == "new-refresh"
 
 
 @pytest.mark.asyncio
@@ -177,29 +244,32 @@ async def test_repeated_cancellation_waits_for_rotation_before_releasing_lock(tm
     credentials = await store.load()
     started = threading.Event()
     release = threading.Event()
-    request_lock = asyncio.Lock()
+    calls = []
 
     def refresh(*args):
+        calls.append(args)
         started.set()
         release.wait(timeout=2)
         return {"access_token": "rotated-access", "refresh_token": "rotated-refresh"}, 200
 
-    async def locked_refresh():
-        async with request_lock:
-            return await store.refresh(credentials, SimpleNamespace(refresh_device_token=refresh))
-
-    task = asyncio.create_task(locked_refresh())
-    await asyncio.to_thread(started.wait, 1)
+    api = SimpleNamespace(refresh_device_token=refresh)
+    task = asyncio.create_task(store.refresh(credentials, api))
+    assert await asyncio.to_thread(started.wait, 1)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
+    next_request = asyncio.create_task(store.refresh(credentials, api, force=True))
     try:
+        await asyncio.sleep(0)
         assert not task.done()
-        assert request_lock.locked()
+        assert not next_request.done()
+        assert len(calls) == 1
     finally:
         release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert not request_lock.locked()
+    updated = await asyncio.wait_for(next_request, timeout=1)
+    assert updated.pairing["refresh_token"] == "rotated-refresh"
+    assert len(calls) == 1
     assert json.loads((tmp_path / "pairing.json").read_text())["refresh_token"] == "rotated-refresh"

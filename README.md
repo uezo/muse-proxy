@@ -125,7 +125,8 @@ flowchart LR
 Muse acknowledges outgoing messages separately from delivering generated replies.
 Two requests sent to Muse may produce one combined reply or several reply messages.
 Requests in the same session share one subscription, allowing additional messages while a reply is pending.
-Connections for different sessions are processed serially within the account.
+Different sessions use independent connections and can send messages and receive replies concurrently.
+Credential refresh is serialized within the proxy to keep token updates consistent.
 
 ### Message types
 
@@ -226,6 +227,12 @@ Use the same `session_id` to continue the same chat. Omitting it uses `default_s
 Labels are deterministically mapped to UUIDs using the device identity: the same device identity and label always produce the same UUID.
 If you supply a UUID, the proxy uses that UUID directly.
 `session_id` must contain 1–64 ASCII letters, digits, or hyphens.
+
+**Deleted chats:** If sending to a session fails with Muse's `chat no longer exists` error,
+the chat may have been deleted and its ID may no longer be reusable.
+Use a new `session_id`, or change `default_session_id` (for example, from `muse-proxy` to `muse-proxy-1`) and restart the proxy.
+Restarting alone keeps the same label mapped to the same UUID.
+See [session ID reuse](docs/reference.md#session-id-reuse) for the observed behavior and its limits.
 
 **When a reply has no request association ID, the proxy assigns it to the latest acknowledged pending request
 in the same session and sends `cancel` to all other acknowledged pending requests.**
