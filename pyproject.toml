@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "muse-proxy"
+version = "0.1.0"
+description = "Access Muse through an OpenAI-compatible text chat API."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "uezo", email = "uezo@uezo.net" }]
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.10,<3",
+  "starlette>=0.47,<2",
+  "uvicorn>=0.35,<1",
+  "musegadget @ git+https://github.com/facebookincubator/muse-gadget-sdk.git@e6fe5174092702ffddae6f90759a38d55a4ebae1#subdirectory=linux",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Communications",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=1",
+  "httpx>=0.28,<1",
+  "openai>=1.100,<4",
+  "ruff>=0.12",
+  "build>=1.2",
+]
+
+[project.scripts]
+muse-proxy = "muse_proxy.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/muse_proxy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
