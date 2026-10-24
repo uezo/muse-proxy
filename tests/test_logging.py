@@ -87,7 +87,7 @@ async def test_success_logs_arrival_identity_counts_and_full_response(tmp_path, 
         response = await http.post(
             "/v1/chat/completions?key=" + PRIVATE,
             headers={"X-Request-ID": PRIVATE},
-            json=payload(stream=stream, session_id=PRIVATE),
+            json=payload(model=PRIVATE, stream=stream, session_id=PRIVATE),
         )
     assert response.status_code == 200
     logs = messages(caplog)
@@ -109,7 +109,6 @@ async def test_success_logs_arrival_identity_counts_and_full_response(tmp_path, 
     [
         ("auth", 401, "invalid_api_key", "-"),
         ("origin", 403, "origin_rejected", "-"),
-        ("model", 404, "model_not_found", "model"),
         ("tools", 400, "invalid_request_error", "tools"),
         ("messages", 400, "invalid_request_error", "messages"),
         ("content", 400, "invalid_request_error", "messages[0].content"),
@@ -130,8 +129,6 @@ async def test_rejected_requests_log_safe_code_and_parameter_without_changing_he
         headers["Authorization"] = "Bearer " + PRIVATE
     elif case == "origin":
         headers["Origin"] = "https://" + PRIVATE + ".example"
-    elif case == "model":
-        body["model"] = PRIVATE
     elif case == "tools":
         body["tools"] = [{"type": "function", "function": {"name": PRIVATE}}]
     elif case == "messages":

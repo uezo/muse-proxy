@@ -39,17 +39,8 @@ class ChatRequest:
 def parse_chat(payload: Any, default_model: str, *, max_message_chars: int = 16000) -> ChatRequest:
     if not isinstance(payload, dict):
         raise _invalid("Request body must be a JSON object.")
-    model = payload.get("model", default_model)
-    if not isinstance(model, str) or not model.strip() or len(model) > 128:
-        raise _invalid("model must be a nonempty string of up to 128 characters.", "model")
-    _unicode(model, "model")
-    if model != default_model:
-        raise ProxyError(
-            "The requested model is not available.",
-            status_code=404,
-            code="model_not_found",
-            param="model",
-        )
+    # Muse selects the backend through the paired account and VM, not this field.
+    # Accept clients' model values for compatibility; report the configured alias.
     stream = payload.get("stream", False)
     if type(stream) is not bool:
         raise _invalid("stream must be a boolean.", "stream")
@@ -112,7 +103,9 @@ def parse_chat(payload: Any, default_model: str, *, max_message_chars: int = 160
                     f"The latest user message must contain 1 to {max_message_chars} characters.",
                     param,
                 )
-            return ChatRequest(_unicode(text, param), model, stream, include_usage, session_id)
+            return ChatRequest(
+                _unicode(text, param), default_model, stream, include_usage, session_id
+            )
     raise _invalid("messages must contain a user message.", "messages")
 
 

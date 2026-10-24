@@ -128,12 +128,33 @@ async def test_sdk_maps_invalid_proxy_key_to_authentication_error(tmp_path):
     assert muse.sent == []
 
 
-async def test_sdk_maps_unknown_model_to_not_found_error_without_sending(tmp_path):
+@pytest.mark.parametrize("stream", [False, True])
+async def test_sdk_accepts_arbitrary_client_model_and_reports_configured_alias(tmp_path, stream):
+    async with openai_client(tmp_path) as (client, muse):
+        result = await client.chat.completions.create(
+            model="third-party-model",
+            messages=[{"role": "user", "content": "Send once"}],
+            stream=stream,
+        )
+        if stream:
+            async with result:
+                chunks = [chunk async for chunk in result]
+            assert all(chunk.model == "muse" for chunk in chunks)
+            assert chunks[-1].choices[0].finish_reason == "stop"
+            assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == (
+                "返信: Send once 🌏"
+            )
+        else:
+            assert result.model == "muse"
+            assert result.choices[0].message.content == "返信: Send once 🌏"
+    assert muse.sent == [("Send once", None)]
+    assert muse.finished == ["Send once"]
+
+
+async def test_sdk_model_lookup_still_returns_not_found_for_unknown_alias(tmp_path):
     async with openai_client(tmp_path) as (client, muse):
         with pytest.raises(NotFoundError) as failure:
-            await client.chat.completions.create(
-                model="missing", messages=[{"role": "user", "content": "Do not send"}]
-            )
+            await client.models.retrieve("missing")
     assert failure.value.status_code == 404
     assert failure.value.code == "model_not_found"
     assert muse.sent == []
