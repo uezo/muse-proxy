@@ -50,6 +50,15 @@ def test_text_parts_join_in_order_and_session_id_targets_side_chat():
     assert result.session_id == "side-chat-1"
 
 
+@pytest.mark.parametrize(
+    "model", ["other", "", "   ", "m" * 129, "\ud800", None, 123, True, [], {}]
+)
+def test_client_model_is_ignored_and_configured_alias_is_used(model):
+    result = parse_chat(payload(model=model), default_model="custom-muse")
+    assert result.model == "custom-muse"
+    assert result.text == "hello"
+
+
 @pytest.mark.parametrize("value", [None, [], {}, 123, True, "text"])
 def test_request_must_be_an_object_with_a_user_message(value):
     with pytest.raises(ProxyError) as failure:

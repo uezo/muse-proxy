@@ -53,7 +53,7 @@ class FakeMuse:
 @asynccontextmanager
 async def proxy(tmp_path, muse=None, **options):
     muse = muse or FakeMuse()
-    settings = Settings(api_key=KEY, state_dir=tmp_path, model="muse", **options)
+    settings = Settings(api_key=KEY, state_dir=tmp_path, **options)
     app = create_app(settings, client=muse)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -193,12 +193,29 @@ async def test_sse_preserves_identity_unicode_order_and_terminal_frame(tmp_path,
         assert all("usage" not in chunk for chunk in chunks)
 
 
-async def test_unknown_model_returns_404_before_sending(tmp_path):
-    async with proxy(tmp_path) as (http, muse):
-        response = await http.post("/v1/chat/completions", json=chat_payload(model="other"))
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "model_not_found"
-    assert muse.sent == []
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["muse", "custom-muse"])
+async def test_client_model_is_ignored_and_responses_use_configured_alias(tmp_path, stream, model):
+    async with proxy(tmp_path, model=model) as (http, muse):
+        response = await http.post(
+            "/v1/chat/completions",
+            json=chat_payload(model="third-party-model", stream=stream),
+        )
+    assert response.status_code == 200
+    if stream:
+        frames = sse_frames(response)
+        assert frames[-1] == "[DONE]"
+        chunks = [json.loads(frame) for frame in frames[:-1]]
+        assert all(chunk["model"] == model for chunk in chunks)
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks) == (
+            "返信: こんにちは🌏"
+        )
+    else:
+        assert response.json()["model"] == model
+        assert response.json()["choices"][0]["message"]["content"] == "返信: こんにちは🌏"
+    assert muse.sent == [("こんにちは🌏", None)]
+    assert muse.finished == ["こんにちは🌏"]
 
 
 @pytest.mark.parametrize(

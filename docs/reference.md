@@ -40,7 +40,7 @@ If the last user message is empty, too long, or non-text, the proxy returns an e
 
 | Field | Support |
 | --- | --- |
-| `model` | Only the configured name is accepted. Defaults to the configured value when omitted; other names return 404. It does not select Muse's underlying model |
+| `model` | Ignored, whether supplied or omitted. Responses always use the configured alias. It is not forwarded to Muse and does not select its underlying model or VM |
 | `messages` | An array containing at least one message. The last user message must contain non-whitespace text |
 | `content` | A string, or an array of text parts with `type: "text"` / `"input_text"`. Array entries are joined with newlines |
 | `stream` | Boolean; defaults to `false` |
@@ -346,7 +346,7 @@ Start the proxy with `muse-proxy serve --config /path/to/proxy.toml` to load TOM
 | `state_dir` | `data/muse` | Directory containing existing Muse credentials; relative paths resolve against the configuration file, and `~` is supported |
 | `host` | `127.0.0.1` | HTTP listening address |
 | `port` | `8766` | HTTP listening port |
-| `model` | `muse` | Public model name |
+| `model` | `muse` | Model alias advertised by the API and returned in responses |
 | `default_session_id` | `None`; `init` sets `muse-proxy` | Conversation used when the request does not specify one |
 | `sdk_token` | Unset | The same Muse SDK token used for pairing |
 | `vm_id` | Unset | Muse VM ID or name; when omitted, uses the default VM, or the first listed VM if there is no default |
@@ -383,8 +383,9 @@ Other selected levels apply to both proxy and server logs.
 The root logger and SDK/network logger levels are left unchanged; Uvicorn's normal access log remains disabled.
 When embedding `create_app()` without the CLI, configure the `muse_proxy` logger in the hosting application to receive these diagnostics.
 
-For third-party clients, first verify base URL `http://127.0.0.1:8766/v1`, the proxy Bearer key, and the configured model name.
-An unrecognized endpoint returns 404; a wrong key returns `invalid_api_key` (401), and a wrong model returns `model_not_found` (404).
+For third-party clients, first verify base URL `http://127.0.0.1:8766/v1` and the proxy Bearer key.
+An unrecognized endpoint returns 404; a wrong key returns `invalid_api_key` (401).
+Chat requests ignore the client's `model`; only `GET /v1/models/{model}` requires the configured alias and returns `model_not_found` (404) for other names.
 If no arrival is logged at `info` level, check the client destination, listener, and reverse proxy.
 Browser-based clients may send a cross-origin `Origin` header or an `OPTIONS` preflight request: origin rejection returns 403,
 and preflight requests return 405. CORS and additional API routes are not enabled by logging.
@@ -408,7 +409,7 @@ The main codes are listed below.
 | 400 | `invalid_request_error` | Invalid JSON, input, or unsupported parameters |
 | 401 | `invalid_api_key` | Invalid proxy Bearer key |
 | 403 | `origin_rejected` | Cross-origin request |
-| 404 | `model_not_found` | Model name differs from the configured name |
+| 404 | `model_not_found` | `GET /v1/models/{model}` requested a name other than the configured alias |
 | 413 | `body_too_large` | HTTP body exceeds the size limit |
 | 429 | `muse_busy` | Too many pending requests |
 | 503 | `muse_credentials_error` / `muse_sdk_unavailable` | Required credential files or SDK are unavailable |
@@ -421,7 +422,7 @@ The main codes are listed below.
 The HTTP statuses in this table apply when the status can still be set, such as non-streaming REST responses or errors before SSE starts.
 A valid `stream: true` request first receives HTTP 200 and a role chunk.
 Errors discovered while connecting to Muse, including missing credential files, therefore appear inside an HTTP 200 SSE response.
-Proxy key, input, and model name validation happen before SSE starts, so invalid values produce non-2xx JSON errors.
+Proxy key and input validation happen before SSE starts, so invalid values produce non-2xx JSON errors.
 Framework errors, such as 404 for an unknown route, do not necessarily use this JSON format.
 
 Once SSE has started, the HTTP status cannot change.
