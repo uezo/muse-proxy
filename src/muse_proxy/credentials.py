@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from ._upstream import current_trace
 from .errors import ProxyError
 
 TOKEN_REFRESH_AGE_SECONDS = 3 * 3600
@@ -143,7 +144,10 @@ class CredentialStore:
         self._sdk_token = sdk_token
 
     async def load(self) -> Credentials:
-        return await asyncio.to_thread(_load, self.directory, self._sdk_token)
+        credentials = await asyncio.to_thread(_load, self.directory, self._sdk_token)
+        if trace := current_trace():
+            trace.credentials(credentials)
+        return credentials
 
     async def refresh(
         self, credentials: Credentials, api: Any, *, force: bool = False
@@ -156,12 +160,41 @@ class CredentialStore:
             return credentials
 
         def rotate() -> Credentials:
-            tokens, status = api.refresh_device_token(
-                credentials.pairing["refresh_token"],
-                credentials.node_id,
-                credentials.api_root,
-                credentials.sdk_token,
-            )
+            trace = current_trace()
+            if trace is not None:
+                trace.credentials(credentials)
+                trace.emit(
+                    "muse.api.request",
+                    protocol="https",
+                    method="POST",
+                    path="/device_token/refresh",
+                    api_root=credentials.api_root,
+                    body={"device_id": credentials.node_id, "sdk_token": credentials.sdk_token},
+                )
+            try:
+                tokens, status = api.refresh_device_token(
+                    credentials.pairing["refresh_token"],
+                    credentials.node_id,
+                    credentials.api_root,
+                    credentials.sdk_token,
+                )
+            except Exception as exc:
+                if trace is not None:
+                    trace.failure("device_token.refresh", exc, protocol="https")
+                raise
+            if trace is not None:
+                if isinstance(tokens, dict):
+                    trace.credentials(
+                        Credentials(credentials.node_id, tokens, credentials.sdk_token)
+                    )
+                trace.emit(
+                    "muse.api.response",
+                    protocol="https",
+                    path="/device_token/refresh",
+                    http_status=status,
+                    body=tokens,
+                    body_availability="sdk_result",
+                )
             if not isinstance(tokens, dict) or not all(
                 isinstance(tokens.get(key), str) and tokens[key].strip()
                 for key in ("access_token", "refresh_token")

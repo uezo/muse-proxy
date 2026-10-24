@@ -366,7 +366,7 @@ The serve-only `--log-level` option accepts these levels, from most to least det
 
 | Level | Output |
 | --- | --- |
-| `trace` | DEBUG diagnostics plus submitted JSON and outgoing JSON/SSE bodies |
+| `trace` | DEBUG diagnostics plus client HTTP bodies and decoded Muse requests, responses, acknowledgements, and events |
 | `debug` | INFO diagnostics plus proxy events and upstream connection phases, without conversation content |
 | `info` | Request arrivals, HTTP status and duration, accepted chats, and conversation outcomes |
 | `warning` | Request failures and other warnings |
@@ -384,23 +384,62 @@ An accepted chat request also logs its generated completion `request_id`, matchi
 Conversation outcomes distinguish success, cancellation, and failure. Failures log a sanitized error code and, where available, a parameter name.
 The HTTP status alone is insufficient: an SSE failure after headers have been sent still has status 200 and is logged as a failure.
 
-TRACE adds these structured body records:
+TRACE covers both sides of the proxy.
+
+The `muse_proxy.http` logger adds these client-facing body records:
 
 - `http.request.body`: the submitted JSON after authentication and JSON parsing, before protocol validation. It includes fields ignored by the proxy, such as `model` and earlier conversation history, as well as any submitted `session_id`.
 - `http.response.body`: the outgoing JSON response or each SSE frame, including progress, replies, cancellation, errors, `[DONE]`, and keepalives. Records include `format=json|sse`, `sequence`, and a JSON-encoded `body` value. Streaming frames are logged as they are sent without waiting for the entire response.
 
-Body records include `http_id` and `request_id`; `request_id` is `-` before a chat request has been accepted.
-Credential-like JSON fields are recursively redacted, and occurrences of the configured proxy API key and SDK token are masked.
-Logging does not load credential files just to obtain values to mask.
-Headers and query strings are never logged. TRACE records the proxy's HTTP interface, rather than raw Muse network traffic.
-**TRACE logs contain private conversation text, submitted history, and session IDs.**
+These records include `http_id` and `request_id`; `request_id` is `-` before a chat request has been accepted.
 
-Malformed request bodies and malformed or partial response bodies use omission markers instead of raw text.
+The `muse_proxy.upstream` logger records Muse communication before it is converted to the client-facing protocol:
+
+| Exchange | TRACE contents |
+| --- | --- |
+| Muse application requests | Method, path, stream ID, SDK request ID, and outbound JSON, including `/chat/stream` message, device ID, session UUID, and output modality |
+| Muse application responses | Original response status and decoded body, including subscription failures; the SDK acknowledgement envelope containing `ok`, `status`, and `response` is also preserved |
+| Subscription events | Decoded NDJSON events before proxy routing, including progress, replies, and task state |
+| Connection and registration | WebSocket upgrade outcome, registration/control messages, close outcome, and available error/status details |
+| VM lookup and token refresh | HTTP method, path, available response status, and SDK-normalized result; `body_availability=sdk_result` distinguishes this from an original response body |
+
+Correlate the accepted HTTP request's `request_id` with upstream records.
+The `router_id` identifies a shared Muse connection, `stream_id` identifies an application stream within it, and `upstream_request_id` identifies the SDK's `x-request-id`.
+A subscription can carry events for multiple pending requests; those events are observed before the proxy decides which request receives them.
+Shared connection and subscription records use `request_id=-`; follow their `router_id` back to the request's route record.
+
+For example, these illustrative records show a Muse refusal and its body on the same application stream:
+
+```text
+TRACE muse_proxy.upstream muse.response router_id=router-example request_id=chatcmpl-example upstream_request_id=sdk-request-example stream_id=7 method=POST path=/chat/stream status=400 headers={"content-type":"application/json"}
+TRACE muse_proxy.upstream muse.response.body router_id=router-example request_id=chatcmpl-example upstream_request_id=sdk-request-example stream_id=7 method=POST path=/chat/stream format=json sequence=1 body={"error":"Example rejection reason"}
+```
+
+The example's status and error text are placeholders; actual records preserve the upstream values after redaction.
+
+The statuses have separate meanings. A WebSocket upgrade status describes establishing the connection.
+A Muse application response status describes that operation over the encrypted connection.
+The final proxy HTTP status describes the response returned to the external client.
+For example, `muse_request_error` with proxy HTTP 502 can follow a Muse application refusal with a different upstream status.
+Inspect the original upstream body and SDK acknowledgement instead of treating 502 as Muse's own status.
+
+VM lookup and token refresh use the SDK's HTTP API. The SDK discards some raw HTTP error bodies; TRACE cannot reconstruct them and records the SDK result with an explicit availability marker.
+No additional request is sent to collect diagnostics. Logging observes the existing connection and stream without consuming subscription events a second time.
+The Muse records show the decoded application protocol, not encrypted wire bytes.
+
+Credential-like fields are recursively redacted. Recognized values include the configured proxy key and SDK token, loaded Muse access/refresh tokens and VM authentication values, and refreshed tokens.
+Credential files are not read just for logging. Client headers and query strings are excluded, and credential fields such as private keys are redacted.
+Upstream protocol headers use an explicit diagnostic allowlist: `x-request-id`, `content-type`, `accept`, and `x-app-id`. Authentication, cookie, and other upstream headers are excluded.
+**TRACE logs contain private conversation text, submitted history, device IDs, and session IDs.**
+
+For client-facing HTTP logs, malformed request bodies and malformed or partial response bodies use omission markers instead of raw text.
 Each submitted JSON body, JSON response, or SSE frame has a 1 MiB logging limit.
-If a response body or frame exceeds that limit, an omission marker is logged and remaining response body logging stops.
-Excessively nested JSON is also omitted. These logging limits do not change the actual HTTP response or the existing request-size limit.
+If an HTTP response body or frame exceeds that limit, an omission marker is logged and remaining response body logging stops.
+Excessively nested JSON is also omitted.
+Upstream Muse records and buffered application bodies or NDJSON lines also have a 1 MiB logging limit and use size-limit omission markers when exceeded.
+These logging limits do not change the actual response, the existing request-size limit, or the subscription's delivery to the proxy.
 
-DEBUG and less detailed levels exclude request and reply bodies and session IDs.
+DEBUG and less detailed levels exclude request and reply bodies and session IDs. Muse refusals log a safe integer upstream status at WARNING when available.
 Proxy request diagnostics include recognized route names rather than arbitrary raw paths.
 Use `--log-level debug` for proxy diagnostics without conversation content.
 Uvicorn stays at `info` for TRACE and DEBUG because server debug logs can include WebSocket handshake headers.

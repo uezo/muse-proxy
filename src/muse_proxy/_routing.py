@@ -11,8 +11,10 @@ from contextlib import suppress
 from typing import Any
 from uuid import uuid4
 
+from ._upstream import MuseTrace, instrument_session, trace_context
 from .errors import ProxyError
 from .events import MuseMessage
+from .logging import TRACE_LEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,15 @@ class _ChatRouter:
     def __init__(self, client: Any, session_id: str | None):
         self.client = client
         self.trace_id = f"router-{uuid4().hex}"
+        settings = getattr(client, "settings", None)
+        self.trace = (
+            MuseTrace(
+                self.trace_id,
+                secrets=(getattr(settings, "api_key", None), getattr(settings, "sdk_token", None)),
+            )
+            if logger.isEnabledFor(TRACE_LEVEL)
+            else None
+        )
         self.phase = "created"
         self.session_id = session_id
         self.waiters: list[_Waiter] = []
@@ -124,6 +135,8 @@ class _ChatRouter:
         if len(self.waiters) >= 64:
             raise ProxyError("Too many pending Muse requests.", status_code=429, code="muse_busy")
         self.waiters.append(waiter)
+        if self.trace is not None:
+            self.trace.emit("muse.route", request_id=waiter.request_id, session_id=self.session_id)
         self._wake()
 
     def _wake(self) -> None:
@@ -140,6 +153,8 @@ class _ChatRouter:
 
     async def _consume(self, events: Any) -> None:
         async for event in events:
+            if self.trace is not None:
+                self.trace.emit("muse.event", request_id="-", body=event)
             # A broken or very fast upstream must not grow memory without bound.
             try:
                 self.received += 1
@@ -175,9 +190,23 @@ class _ChatRouter:
         self._phase("send")
         self.sending = waiter
         waiter.send_after = self.received
-        self.submission = asyncio.create_task(
-            self.session.send_chat(waiter.text, self.session_id, output_modality="text")
-        )
+
+        async def submit():
+            with trace_context(self.trace, waiter.request_id):
+                if self.trace is not None:
+                    self.trace.emit(
+                        "muse.chat.submit",
+                        body={
+                            "message": waiter.text,
+                            "session_id": self.session_id,
+                            "output_modality": "text",
+                        },
+                    )
+                return await self.session.send_chat(
+                    waiter.text, self.session_id, output_modality="text"
+                )
+
+        self.submission = asyncio.create_task(submit())
 
     def _event_size(self, event: dict) -> int:
         return len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
@@ -199,8 +228,17 @@ class _ChatRouter:
         self._phase("acknowledge")
         try:
             response = submission.result()
+            if self.trace is not None:
+                self.trace.emit(
+                    "muse.chat.acknowledgement", request_id=waiter.request_id, body=response
+                )
             if not isinstance(response, dict) or response.get("ok") is not True:
                 status = response.get("status") if isinstance(response, dict) else None
+                logger.warning(
+                    "Muse refused chat router_id=%s upstream_status=%s",
+                    self.trace_id,
+                    status if type(status) is int else "-",
+                )
                 if status == 401:
                     await self.client._store.refresh(self.credentials, self.sdk.api, force=True)
                 code = "muse_auth_error" if status in (401, 403) else "muse_request_error"
@@ -254,7 +292,9 @@ class _ChatRouter:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            if self.trace is not None:
+                self.trace.failure("chat.acknowledge", exc, request_id=waiter.request_id)
             waiter.finish(ProxyError("Muse communication failed.", code="muse_connection_error"))
         held, self.buffered = self.buffered, []
         self.buffered_bytes = 0
@@ -428,6 +468,10 @@ class _ChatRouter:
         )
 
     async def run(self) -> None:
+        with trace_context(self.trace):
+            await self._run()
+
+    async def _run(self) -> None:
         from .muse import _load_sdk, _refuse_command, _RequestTurn
 
         error: ProxyError | None = None
@@ -458,6 +502,10 @@ class _ChatRouter:
                 device=device,
                 run_command=_refuse_command,
             )
+            if self.trace is not None:
+                self.trace.credentials(self.credentials)
+                self.trace.add_secrets(vm.get("vm_auth_token"))
+                instrument_session(self.session, self.trace)
             if self.session_id:
                 self.scope = self.client._replay_scopes.get(self.session_id)
                 if self.scope is None:
@@ -533,11 +581,15 @@ class _ChatRouter:
         except asyncio.CancelledError:
             raise
         except ProxyError as exc:
+            if self.trace is not None:
+                self.trace.failure(self.phase, exc)
             logger.warning(
                 "Muse connection failed router_id=%s phase=%s", self.trace_id, self.phase
             )
             error = exc
-        except Exception:
+        except Exception as exc:
+            if self.trace is not None:
+                self.trace.failure(self.phase, exc)
             logger.warning(
                 "Muse connection failed router_id=%s phase=%s", self.trace_id, self.phase
             )
