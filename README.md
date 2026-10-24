@@ -342,23 +342,30 @@ Logs show the HTTP method, recognized route, response status, duration, and comp
 Failures include a sanitized error code and, when available, the parameter name.
 An unknown route is sanitized instead of logging its raw path.
 
-Use `trace` to inspect submitted JSON and outgoing JSON or SSE frames:
+Use `trace` to inspect both the client-facing HTTP exchange and the requests and responses exchanged with Muse:
 
 ```sh
 muse-proxy serve --config proxy.toml --log-level trace
 ```
 
 Supported levels, from most to least detailed, are `trace`, `debug`, `info`, `warning`, `error`, and `critical`.
-TRACE adds `http.request.body` and `http.response.body` records correlated by `http_id` and `request_id`.
-SSE frames are logged as they are sent, including `[DONE]` and keepalives.
-Credential fields and configured key/token values are masked; headers and query strings are never logged.
-**TRACE logs contain private conversation text, submitted history, and session IDs.**
+TRACE records include:
+
+- Client requests and outgoing JSON/SSE frames, including `[DONE]` and keepalives.
+- Decoded Muse requests, application response statuses and bodies, SDK acknowledgements, and incoming subscription events before reply routing.
+- Connection, registration, and close outcomes, plus VM lookup and token-refresh HTTP statuses where available.
+
+Follow `request_id` from the accepted chat into the `muse_proxy.upstream` records; `router_id`, `stream_id`, and `upstream_request_id` link the shared connection and individual Muse exchanges.
+A proxy HTTP 502 is separate from Muse's upstream status: inspect the Muse response body and acknowledgement to identify the refusal.
+VM lookup and token refresh expose SDK-normalized results; raw HTTP error bodies discarded by the SDK are unavailable.
+Credential fields and recognized key/token values are masked. Client headers and query strings, and upstream authentication headers, are excluded.
+**TRACE logs contain private conversation text, submitted history, device IDs, and session IDs.**
 Malformed, oversized, or excessively nested bodies use omission markers; see [logging details and limits](docs/reference.md#terminal-logging).
 
 For additional diagnostics without conversation content, use `--log-level debug`.
-DEBUG and less detailed levels omit bodies and session IDs.
+DEBUG and less detailed levels omit bodies and session IDs. Muse refusals also log a safe upstream status when available.
 Uvicorn stays at `info` for TRACE and DEBUG to avoid WebSocket handshake/header dumps.
-SDK and network-library logging levels are left unchanged; TRACE does not dump raw Muse network traffic.
+SDK and network-library logging levels remain unchanged. Muse records contain the decoded application protocol; encrypted wire bytes are not dumped.
 **An SSE request can log HTTP 200 and still fail:** inspect the error code and the stream's error frame, not just the HTTP status.
 
 For a third-party client, check these settings and log results:
@@ -370,6 +377,7 @@ For a third-party client, check these settings and log results:
 | 401 / `invalid_api_key` | Use the proxy's `api_key`, rather than a Muse token |
 | 404 / `model_not_found` on model lookup | `GET /v1/models/{model}` requires the configured alias; chat requests ignore `model` |
 | 400 / `invalid_request_error` | Check the logged parameter and the [supported request fields](docs/reference.md#openai-compatible-protocol) |
+| 502 / `muse_request_error` | At TRACE, follow `request_id` into `muse_proxy.upstream` and inspect the Muse acknowledgement and upstream response status/body |
 | 403 / `origin_rejected`, or `OPTIONS` returns 405 | A browser client is making a cross-origin request; the proxy does not enable CORS or handle preflight requests. Route through the application's backend or a suitable same-origin deployment |
 
 These diagnostics do not change the API's authentication, origin checks, or supported endpoints.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -12,9 +13,11 @@ from contextlib import aclosing, suppress
 from types import SimpleNamespace
 from typing import Any
 
+from ._upstream import MuseTrace, current_trace, instrument_session, trace_context
 from .credentials import CredentialStore
 from .errors import ProxyError
 from .events import MuseMessage
+from .logging import TRACE_LEVEL
 
 
 def _load_sdk() -> SimpleNamespace:
@@ -341,6 +344,12 @@ class MuseClient:
             self._active.add(owner)
         deadline = asyncio.get_running_loop().time() + self.settings.request_timeout_seconds
         acquired = False
+        trace = current_trace()
+        if trace is None and logging.getLogger("muse_proxy.upstream").isEnabledFor(TRACE_LEVEL):
+            trace = MuseTrace(
+                f"legacy-{uuid.uuid4().hex}",
+                secrets=(getattr(self.settings, "api_key", None), self.settings.sdk_token),
+            )
         try:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -357,7 +366,8 @@ class MuseClient:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         raise TimeoutError
-                    pending = asyncio.create_task(anext(reply))
+                    with trace_context(trace):
+                        pending = asyncio.create_task(anext(reply))
                     try:
                         chunk = await asyncio.wait_for(pending, timeout=remaining)
                     except StopAsyncIteration:
@@ -383,7 +393,9 @@ class MuseClient:
             ) from None
         except ProxyError:
             raise
-        except Exception:
+        except Exception as exc:
+            if trace is not None:
+                trace.failure("stream_events", exc)
             # SDK/network exceptions can contain token-bearing URLs or response content.
             raise ProxyError("Muse communication failed.", code="muse_connection_error") from None
         finally:
@@ -394,16 +406,47 @@ class MuseClient:
 
     async def _vm(self, sdk: Any, credentials: Any) -> tuple[dict, Any]:
         credentials = await self._store.refresh(credentials, sdk.api)
-        vms, status = await asyncio.to_thread(
-            sdk.api.fetch_vms_with_status, credentials.pairing["access_token"], credentials.api_root
-        )
+        trace = current_trace()
+
+        async def fetch():
+            if trace is not None:
+                trace.credentials(credentials)
+                trace.emit(
+                    "muse.api.request",
+                    protocol="https",
+                    method="GET",
+                    path="/fetch_vms",
+                    api_root=credentials.api_root,
+                    body=None,
+                )
+            try:
+                vms, status = await asyncio.to_thread(
+                    sdk.api.fetch_vms_with_status,
+                    credentials.pairing["access_token"],
+                    credentials.api_root,
+                )
+            except Exception as exc:
+                if trace is not None:
+                    trace.failure("fetch_vms", exc, protocol="https")
+                raise
+            if trace is not None:
+                for vm in vms if isinstance(vms, (list, tuple)) else ():
+                    if isinstance(vm, dict):
+                        trace.add_secrets(vm.get("vm_auth_token"))
+                trace.emit(
+                    "muse.api.response",
+                    protocol="https",
+                    path="/fetch_vms",
+                    http_status=status,
+                    body=vms,
+                    body_availability="sdk_result",
+                )
+            return vms, status
+
+        vms, status = await fetch()
         if status == 401:
             credentials = await self._store.refresh(credentials, sdk.api, force=True)
-            vms, status = await asyncio.to_thread(
-                sdk.api.fetch_vms_with_status,
-                credentials.pairing["access_token"],
-                credentials.api_root,
-            )
+            vms, status = await fetch()
         if status == 401:
             raise ProxyError(
                 "Muse rejected the device credentials.", status_code=503, code="muse_auth_error"
@@ -497,6 +540,11 @@ class MuseClient:
             device=device,
             run_command=_refuse_command,
         )
+        trace = current_trace()
+        if trace is not None:
+            trace.credentials(credentials)
+            trace.add_secrets(vm.get("vm_auth_token"))
+            instrument_session(session, trace)
         if session_id:
             scope = self._replay_scopes.get(session_id)
             if scope is None:
