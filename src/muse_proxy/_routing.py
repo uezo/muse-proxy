@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import deque
 from contextlib import suppress
 from typing import Any
+from uuid import uuid4
 
 from .errors import ProxyError
 from .events import MuseMessage
+
+logger = logging.getLogger(__name__)
 
 _END = object()
 _TERMINAL = {"completed", "failed", "errored", "cancelled", "canceled"}
@@ -76,6 +80,8 @@ class _ChatRouter:
 
     def __init__(self, client: Any, session_id: str | None):
         self.client = client
+        self.trace_id = f"router-{uuid4().hex}"
+        self.phase = "created"
         self.session_id = session_id
         self.waiters: list[_Waiter] = []
         self.inbox: asyncio.Queue = asyncio.Queue(maxsize=128)
@@ -110,6 +116,10 @@ class _ChatRouter:
         self.credentials: Any = None
         self.sdk: Any = None
 
+    def _phase(self, phase: str) -> None:
+        self.phase = phase
+        logger.debug("Muse connection phase router_id=%s phase=%s", self.trace_id, phase)
+
     def add(self, waiter: _Waiter) -> None:
         if len(self.waiters) >= 64:
             raise ProxyError("Too many pending Muse requests.", status_code=429, code="muse_busy")
@@ -140,6 +150,7 @@ class _ChatRouter:
                 ) from None
 
     async def _open_subscription(self) -> None:
+        self._phase("subscribe")
         self.iterator = self.session.subscribe_chat(self.session_id)
         self.subscription = asyncio.create_task(self._consume(self.iterator))
         try:
@@ -161,6 +172,7 @@ class _ChatRouter:
         waiter = next((item for item in self.waiters if item.live and not item.acknowledged), None)
         if waiter is None:
             return
+        self._phase("send")
         self.sending = waiter
         waiter.send_after = self.received
         self.submission = asyncio.create_task(
@@ -184,6 +196,7 @@ class _ChatRouter:
         if submission is None or waiter is None or not submission.done():
             return
         self.submission = self.sending = None
+        self._phase("acknowledge")
         try:
             response = submission.result()
             if not isinstance(response, dict) or response.get("ok") is not True:
@@ -230,6 +243,7 @@ class _ChatRouter:
                 self.latest = waiter
             self.root_status = None
             self.terminal_at = None
+            self._phase("waiting_replies")
         except ProxyError as error:
             waiter.finish(error)
         except ValueError:
@@ -419,14 +433,17 @@ class _ChatRouter:
         error: ProxyError | None = None
         acquired = False
         try:
+            self._phase("waiting_account_lock")
             await self.client._lock.acquire()
             acquired = True
             if self.client._closed:
                 raise ProxyError(
                     "Muse proxy is shutting down.", status_code=503, code="muse_unavailable"
                 )
+            self._phase("credentials_load")
             self.credentials = await self.client._store.load()
             self.sdk = _load_sdk()
+            self._phase("vm_lookup")
             vm, self.credentials = await self.client._vm(self.sdk, self.credentials)
             device = self.sdk.DeviceDescription(
                 node_id=self.credentials.node_id,
@@ -458,6 +475,7 @@ class _ChatRouter:
             else:
                 self.turn = self.sdk.MuseTurn(None)
             self.guard = _RequestTurn(self.turn)
+            self._phase("transport_connect_register")
             self.connection = asyncio.create_task(self.session.run(self.stop))
             await self.client._ready(self.session.registered, self.connection)
             try:
@@ -465,6 +483,7 @@ class _ChatRouter:
             except ConnectionError as exc:
                 if not self.session_id or getattr(exc, "status", None) != 404:
                     raise
+                self._phase("create_new_chat")
                 self._start_send()
                 expires = (
                     asyncio.get_running_loop().time() + self.client.settings.connect_timeout_seconds
@@ -488,6 +507,7 @@ class _ChatRouter:
                         if getattr(retry, "status", None) != 404:
                             raise
                         await asyncio.sleep(0.05)
+            self._phase("waiting_replies")
             while any(item.live for item in self.waiters):
                 await self._acknowledge()
                 self._start_send()
@@ -513,8 +533,14 @@ class _ChatRouter:
         except asyncio.CancelledError:
             raise
         except ProxyError as exc:
+            logger.warning(
+                "Muse connection failed router_id=%s phase=%s", self.trace_id, self.phase
+            )
             error = exc
         except Exception:
+            logger.warning(
+                "Muse connection failed router_id=%s phase=%s", self.trace_id, self.phase
+            )
             error = ProxyError("Muse communication failed.", code="muse_connection_error")
         finally:
             self.closing = True
@@ -563,3 +589,4 @@ class _ChatRouter:
                         )
                     )
             self.closed.set()
+            self._phase("closed")

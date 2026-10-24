@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pydantic import ValidationError
 
 from .config import Settings, write_config
+from .logging import configure_logging
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -24,6 +25,13 @@ def _parser() -> argparse.ArgumentParser:
     ):
         command = commands.add_parser(name, help=description)
         command.add_argument("--config", default=argparse.SUPPRESS, help="Configuration file")
+        if name == "serve":
+            command.add_argument(
+                "--log-level",
+                choices=("debug", "info", "warning", "error", "critical"),
+                default="info",
+                help="Proxy logging level (default: info; server debug logs stay disabled)",
+            )
     return parser
 
 
@@ -37,6 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         settings = Settings.from_file(args.config)
+        configure_logging(args.log_level)
         import uvicorn
 
         from .app import create_app
@@ -47,6 +56,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=settings.port,
             workers=1,
             access_log=False,
+            # Uvicorn passes its logger to WebSocket internals, whose debug
+            # output can include handshake headers. Keep those logs at INFO.
+            log_level="info" if args.log_level == "debug" else args.log_level,
         )
         return 0
     except ValidationError as exc:

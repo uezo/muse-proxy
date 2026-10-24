@@ -359,6 +359,38 @@ Start the proxy with `muse-proxy serve --config /path/to/proxy.toml` to load TOM
 If the SDK token is absent from both the environment and configuration, the proxy reads `state_dir/sdk_token`.
 Restart the proxy after changing configuration.
 
+### Terminal logging
+
+`muse-proxy serve` configures logging to stderr at `info` level. No configuration-file changes are required.
+Use the serve-only `--log-level` option to select `debug`, `info`, `warning`, `error`, or `critical`:
+
+```sh
+muse-proxy serve --config /path/to/proxy.toml --log-level debug
+```
+
+Log lines contain a timestamp, severity, logger name, and diagnostic fields.
+Each request receives an internal `http_id` so arrival, HTTP status, and duration can be correlated even if authentication or parsing fails.
+This ID is for logs; it does not add a response header or change error responses.
+An accepted chat request also logs its generated completion `request_id`, matching the existing `x-request-id` response header.
+Conversation outcomes distinguish success, cancellation, and failure. Failures log a sanitized error code and, where available, a parameter name.
+The HTTP status alone is insufficient: an SSE failure after headers have been sent still has status 200 and is logged as a failure.
+
+Proxy request diagnostics include recognized route names rather than arbitrary raw paths.
+They exclude request and reply bodies, credentials, header values, query strings, and session IDs.
+Debug mode adds proxy diagnostics, including upstream connection phases, without enabling Muse SDK or network-library debug logging.
+Uvicorn stays at `info` when proxy debug is selected, because server debug logs can include WebSocket handshake headers.
+Other selected levels apply to both proxy and server logs.
+The root logger and SDK/network logger levels are left unchanged; Uvicorn's normal access log remains disabled.
+When embedding `create_app()` without the CLI, configure the `muse_proxy` logger in the hosting application to receive these diagnostics.
+
+For third-party clients, first verify base URL `http://127.0.0.1:8766/v1`, the proxy Bearer key, and the configured model name.
+An unrecognized endpoint returns 404; a wrong key returns `invalid_api_key` (401), and a wrong model returns `model_not_found` (404).
+If no arrival is logged at `info` level, check the client destination, listener, and reverse proxy.
+Browser-based clients may send a cross-origin `Origin` header or an `OPTIONS` preflight request: origin rejection returns 403,
+and preflight requests return 405. CORS and additional API routes are not enabled by logging.
+
+### Process and connection state
+
 The CLI runs one process with one worker. Do not use the same credentials concurrently in multiple processes or workers.
 Request-to-reply associations live in process memory, and token refresh is coordinated with connections for the same account.
 There is no persistent request/reply queue or stream resumption across restarts.

@@ -12,6 +12,7 @@ from contextlib import aclosing, asynccontextmanager
 from uuid import uuid4
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -19,6 +20,12 @@ from starlette.routing import Route
 from .config import Settings
 from .errors import ProxyError
 from .events import MuseMessage
+from .observability import (
+    RequestLoggingMiddleware,
+    message_received,
+    request_accepted,
+    request_failed,
+)
 from .protocol import ChatRequest, chat_chunk, chat_completion, message_metadata, parse_chat
 
 logger = logging.getLogger(__name__)
@@ -253,6 +260,19 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
             "created": int(time.time()),
             "model": chat.model,
         }
+        request_accepted(
+            request,
+            request_id=identity["id"],
+            stream=chat.stream,
+            session_source=(
+                "request"
+                if chat.session_id is not None
+                else "configured_default"
+                if settings.default_session_id is not None
+                else "main"
+            ),
+            input_chars=len(chat.text),
+        )
         headers = {
             "x-request-id": identity["id"],
             "x-should-retry": "false",
@@ -272,6 +292,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
                 async for part in parts:
                     if part is None:
                         continue
+                    message_received(request, part.kind)
                     sequence += 1
                     if part.kind == "cancel":
                         result = chat_completion("", **identity)
@@ -290,6 +311,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
             except ClientDisconnect:
                 return JSONResponse({}, status_code=499, headers=headers)
             except Exception as exc:
+                request_failed(request, _safe_error(exc))
                 return _error_response(exc, identity["id"])
             finally:
                 await parts.aclose()
@@ -304,6 +326,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
                     if part is None:
                         yield ": keepalive\n\n"
                     else:
+                        message_received(request, part.kind)
                         sequence += 1
                         text = part.text
                         if part.kind == "progress" and text:
@@ -341,6 +364,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
             except ClientDisconnect:
                 return
             except Exception as exc:
+                request_failed(request, _safe_error(exc))
                 yield _frame({"error": _safe_error(exc).as_dict()})
                 yield "data: [DONE]\n\n"
             finally:
@@ -353,6 +377,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
         )
 
     async def proxy_error(request, error):
+        request_failed(request, _safe_error(error))
         return _error_response(error)
 
     app = Starlette(
@@ -363,6 +388,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
             Route("/v1/chat/completions", completions, methods=["POST"]),
         ],
         lifespan=lifespan,
+        middleware=[Middleware(RequestLoggingMiddleware)],
         exception_handlers={ProxyError: proxy_error},
     )
     app.state.client = client
