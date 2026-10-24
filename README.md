@@ -342,16 +342,23 @@ Logs show the HTTP method, recognized route, response status, duration, and comp
 Failures include a sanitized error code and, when available, the parameter name.
 An unknown route is sanitized instead of logging its raw path.
 
-Enable additional proxy diagnostics with:
+Use `trace` to inspect submitted JSON and outgoing JSON or SSE frames:
 
 ```sh
-muse-proxy serve --config proxy.toml --log-level debug
+muse-proxy serve --config proxy.toml --log-level trace
 ```
 
-Supported levels are `debug`, `info`, `warning`, `error`, and `critical`.
-Debug mode enables proxy diagnostics while keeping server logs at `info` to avoid WebSocket handshake/header dumps.
-Other levels apply to both proxy and server logs. SDK and network-library debug logging is not enabled.
-Proxy request logs omit message bodies, API keys, authentication headers, query strings, and session IDs.
+Supported levels, from most to least detailed, are `trace`, `debug`, `info`, `warning`, `error`, and `critical`.
+TRACE adds `http.request.body` and `http.response.body` records correlated by `http_id` and `request_id`.
+SSE frames are logged as they are sent, including `[DONE]` and keepalives.
+Credential fields and configured key/token values are masked; headers and query strings are never logged.
+**TRACE logs contain private conversation text, submitted history, and session IDs.**
+Malformed, oversized, or excessively nested bodies use omission markers; see [logging details and limits](docs/reference.md#terminal-logging).
+
+For additional diagnostics without conversation content, use `--log-level debug`.
+DEBUG and less detailed levels omit bodies and session IDs.
+Uvicorn stays at `info` for TRACE and DEBUG to avoid WebSocket handshake/header dumps.
+SDK and network-library logging levels are left unchanged; TRACE does not dump raw Muse network traffic.
 **An SSE request can log HTTP 200 and still fail:** inspect the error code and the stream's error frame, not just the HTTP status.
 
 For a third-party client, check these settings and log results:

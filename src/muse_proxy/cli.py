@@ -28,9 +28,12 @@ def _parser() -> argparse.ArgumentParser:
         if name == "serve":
             command.add_argument(
                 "--log-level",
-                choices=("debug", "info", "warning", "error", "critical"),
+                choices=("trace", "debug", "info", "warning", "error", "critical"),
                 default="info",
-                help="Proxy logging level (default: info; server debug logs stay disabled)",
+                help=(
+                    "Proxy logging level (default: info; trace logs request/response bodies; "
+                    "server debug logs stay disabled)"
+                ),
             )
     return parser
 
@@ -58,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             access_log=False,
             # Uvicorn passes its logger to WebSocket internals, whose debug
             # output can include handshake headers. Keep those logs at INFO.
-            log_level="info" if args.log_level == "debug" else args.log_level,
+            log_level="info" if args.log_level in {"trace", "debug"} else args.log_level,
         )
         return 0
     except ValidationError as exc:

@@ -1,4 +1,4 @@
-"""Request diagnostics that never inspect or log client or Muse content."""
+"""Request diagnostics with opt-in, redacted HTTP body logging at TRACE."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from uuid import uuid4
 
 from starlette.requests import ClientDisconnect, Request
 
+from ._trace import BodyTrace
 from .errors import ProxyError
+from .logging import TRACE_LEVEL
 
 logger = logging.getLogger("muse_proxy.http")
 _SCOPE_KEY = "muse_proxy.request_log"
@@ -101,19 +103,23 @@ class _RequestLog:
     replies: int = 0
     disconnected: bool = False
     complete: bool = False
+    trace: BodyTrace | None = field(default=None, repr=False)
 
 
 class RequestLoggingMiddleware:
-    """Observe ASGI messages without consuming, buffering, or changing them."""
+    """Observe ASGI traffic without extra reads or changes to outgoing messages."""
 
-    def __init__(self, app):
+    def __init__(self, app, *, redact_values=()):
         self.app = app
+        self._redact_values = redact_values
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         record = _RequestLog()
+        if logger.isEnabledFor(TRACE_LEVEL):
+            record.trace = BodyTrace(record.http_id, self._redact_values)
         scope[_SCOPE_KEY] = record
         method = scope.get("method")
         method = method if method in _METHODS else "OTHER"
@@ -136,6 +142,13 @@ class RequestLoggingMiddleware:
                 record.complete = False
                 record.disconnected = True
                 raise
+            if record.trace is not None:
+                if message["type"] == "http.response.start":
+                    record.trace.start_response(message.get("headers", []))
+                elif message["type"] == "http.response.body":
+                    record.trace.response(
+                        message.get("body", b""), more_body=message.get("more_body", False)
+                    )
             if message["type"] == "http.response.body" and not message.get("more_body", False):
                 record.complete = True
 
@@ -160,6 +173,8 @@ class RequestLoggingMiddleware:
                 )
             raise
         finally:
+            if record.trace is not None:
+                record.trace.finish()
             result = (
                 "disconnected"
                 if record.disconnected
@@ -194,6 +209,8 @@ def request_accepted(
 ) -> None:
     record = request.scope[_SCOPE_KEY]
     record.request_id = request_id
+    if record.trace is not None:
+        record.trace.request_id = request_id
     logger.info(
         "chat.accepted http_id=%s request_id=%s stream=%s session_source=%s input_chars=%d",
         record.http_id,
@@ -202,6 +219,12 @@ def request_accepted(
         session_source,
         input_chars,
     )
+
+
+def request_body(request: Request, value=None, *, omitted: str | None = None) -> None:
+    record = request.scope[_SCOPE_KEY]
+    if record.trace is not None:
+        record.trace.request(value, omitted=omitted)
 
 
 def message_received(request: Request, kind: str) -> None:

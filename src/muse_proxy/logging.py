@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import sys
 
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, "TRACE")
+
 
 def configure_logging(level: str = "info") -> None:
     """Install one CLI-owned stderr handler on the proxy's logging namespace."""
@@ -22,5 +25,5 @@ def configure_logging(level: str = "info") -> None:
         )
     )
     logger.addHandler(handler)
-    logger.setLevel(level.upper())
+    logger.setLevel(TRACE_LEVEL if level.lower() == "trace" else level.upper())
     logger.propagate = False

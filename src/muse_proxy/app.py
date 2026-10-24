@@ -24,6 +24,7 @@ from .observability import (
     RequestLoggingMiddleware,
     message_received,
     request_accepted,
+    request_body,
     request_failed,
 )
 from .protocol import ChatRequest, chat_chunk, chat_completion, message_metadata, parse_chat
@@ -93,10 +94,12 @@ async def _payload(request: Request, max_bytes: int) -> dict:
     async for chunk in request.stream():
         body.extend(chunk)
         if len(body) > max_bytes:
+            request_body(request, omitted="body_too_large")
             raise ProxyError("Request body is too large.", status_code=413, code="body_too_large")
     try:
         return json.loads(body, parse_constant=_invalid_constant)
     except (ValueError, UnicodeError, RecursionError):
+        request_body(request, omitted="invalid_json")
         raise ProxyError(
             "Expected a valid JSON object.", status_code=400, code="invalid_request_error"
         ) from None
@@ -254,6 +257,7 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
     async def completions(request: Request):
         _authorize(request, settings)
         payload = await _payload(request, settings.max_request_bytes)
+        request_body(request, payload)
         chat = parse_chat(payload, settings.model, max_message_chars=settings.max_message_chars)
         identity = {
             "id": f"chatcmpl-{uuid4().hex}",
@@ -388,7 +392,11 @@ def create_app(settings: Settings, *, client=None) -> Starlette:
             Route("/v1/chat/completions", completions, methods=["POST"]),
         ],
         lifespan=lifespan,
-        middleware=[Middleware(RequestLoggingMiddleware)],
+        middleware=[
+            Middleware(
+                RequestLoggingMiddleware, redact_values=(settings.api_key, settings.sdk_token)
+            )
+        ],
         exception_handlers={ProxyError: proxy_error},
     )
     app.state.client = client
