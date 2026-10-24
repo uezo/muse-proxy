@@ -362,10 +362,19 @@ Restart the proxy after changing configuration.
 ### Terminal logging
 
 `muse-proxy serve` configures logging to stderr at `info` level. No configuration-file changes are required.
-Use the serve-only `--log-level` option to select `debug`, `info`, `warning`, `error`, or `critical`:
+The serve-only `--log-level` option accepts these levels, from most to least detailed:
+
+| Level | Output |
+| --- | --- |
+| `trace` | DEBUG diagnostics plus submitted JSON and outgoing JSON/SSE bodies |
+| `debug` | INFO diagnostics plus proxy events and upstream connection phases, without conversation content |
+| `info` | Request arrivals, HTTP status and duration, accepted chats, and conversation outcomes |
+| `warning` | Request failures and other warnings |
+| `error` | Errors and critical failures |
+| `critical` | Critical failures only |
 
 ```sh
-muse-proxy serve --config /path/to/proxy.toml --log-level debug
+muse-proxy serve --config /path/to/proxy.toml --log-level trace
 ```
 
 Log lines contain a timestamp, severity, logger name, and diagnostic fields.
@@ -375,13 +384,30 @@ An accepted chat request also logs its generated completion `request_id`, matchi
 Conversation outcomes distinguish success, cancellation, and failure. Failures log a sanitized error code and, where available, a parameter name.
 The HTTP status alone is insufficient: an SSE failure after headers have been sent still has status 200 and is logged as a failure.
 
+TRACE adds these structured body records:
+
+- `http.request.body`: the submitted JSON after authentication and JSON parsing, before protocol validation. It includes fields ignored by the proxy, such as `model` and earlier conversation history, as well as any submitted `session_id`.
+- `http.response.body`: the outgoing JSON response or each SSE frame, including progress, replies, cancellation, errors, `[DONE]`, and keepalives. Records include `format=json|sse`, `sequence`, and a JSON-encoded `body` value. Streaming frames are logged as they are sent without waiting for the entire response.
+
+Body records include `http_id` and `request_id`; `request_id` is `-` before a chat request has been accepted.
+Credential-like JSON fields are recursively redacted, and occurrences of the configured proxy API key and SDK token are masked.
+Logging does not load credential files just to obtain values to mask.
+Headers and query strings are never logged. TRACE records the proxy's HTTP interface, rather than raw Muse network traffic.
+**TRACE logs contain private conversation text, submitted history, and session IDs.**
+
+Malformed request bodies and malformed or partial response bodies use omission markers instead of raw text.
+Each submitted JSON body, JSON response, or SSE frame has a 1 MiB logging limit.
+If a response body or frame exceeds that limit, an omission marker is logged and remaining response body logging stops.
+Excessively nested JSON is also omitted. These logging limits do not change the actual HTTP response or the existing request-size limit.
+
+DEBUG and less detailed levels exclude request and reply bodies and session IDs.
 Proxy request diagnostics include recognized route names rather than arbitrary raw paths.
-They exclude request and reply bodies, credentials, header values, query strings, and session IDs.
-Debug mode adds proxy diagnostics, including upstream connection phases, without enabling Muse SDK or network-library debug logging.
-Uvicorn stays at `info` when proxy debug is selected, because server debug logs can include WebSocket handshake headers.
+Use `--log-level debug` for proxy diagnostics without conversation content.
+Uvicorn stays at `info` for TRACE and DEBUG because server debug logs can include WebSocket handshake headers.
 Other selected levels apply to both proxy and server logs.
 The root logger and SDK/network logger levels are left unchanged; Uvicorn's normal access log remains disabled.
 When embedding `create_app()` without the CLI, configure the `muse_proxy` logger in the hosting application to receive these diagnostics.
+For TRACE, use numeric level `5` (also exported as `muse_proxy.logging.TRACE_LEVEL`); DEBUG uses level `10`.
 
 For third-party clients, first verify base URL `http://127.0.0.1:8766/v1` and the proxy Bearer key.
 An unrecognized endpoint returns 404; a wrong key returns `invalid_api_key` (401).

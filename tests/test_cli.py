@@ -7,7 +7,7 @@ import pytest
 
 from muse_proxy import cli
 from muse_proxy.config import Settings, write_config
-from muse_proxy.logging import configure_logging
+from muse_proxy.logging import TRACE_LEVEL, configure_logging
 
 
 @pytest.fixture(autouse=True)
@@ -114,7 +114,7 @@ def test_missing_config_returns_useful_error(tmp_path, capsys):
     assert "FileNotFoundError" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("level", ["debug", "info", "warning", "error", "critical"])
+@pytest.mark.parametrize("level", ["trace", "debug", "info", "warning", "error", "critical"])
 def test_serve_passes_selected_log_level(config, monkeypatch, level):
     app_module = ModuleType("muse_proxy.app")
     uvicorn_module = ModuleType("uvicorn")
@@ -125,12 +125,15 @@ def test_serve_passes_selected_log_level(config, monkeypatch, level):
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn_module)
 
     assert cli.main(["serve", "--config", str(config), "--log-level", level]) == 0
-    assert seen[0]["log_level"] == ("info" if level == "debug" else level)
+    assert seen[0]["log_level"] == ("info" if level in {"trace", "debug"} else level)
     assert seen[0]["access_log"] is False
-    assert logging.getLogger("muse_proxy").level == getattr(logging, level.upper())
+    assert logging.getLogger("muse_proxy").level == (
+        TRACE_LEVEL if level == "trace" else getattr(logging, level.upper())
+    )
 
 
-def test_debug_diagnostics_do_not_enable_uvicorn_debug(config, monkeypatch):
+@pytest.mark.parametrize("level", ["trace", "debug"])
+def test_diagnostics_do_not_enable_uvicorn_debug(config, monkeypatch, level):
     app_module = ModuleType("muse_proxy.app")
     uvicorn_module = ModuleType("uvicorn")
     seen = []
@@ -139,14 +142,16 @@ def test_debug_diagnostics_do_not_enable_uvicorn_debug(config, monkeypatch):
     monkeypatch.setitem(sys.modules, "muse_proxy.app", app_module)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn_module)
 
-    assert cli.main(["serve", "--config", str(config), "--log-level", "debug"]) == 0
-    assert logging.getLogger("muse_proxy").level == logging.DEBUG
+    assert cli.main(["serve", "--config", str(config), "--log-level", level]) == 0
+    assert logging.getLogger("muse_proxy").level == (
+        TRACE_LEVEL if level == "trace" else logging.DEBUG
+    )
     assert seen[0]["log_level"] == "info"
     assert seen[0]["access_log"] is False
 
 
 @pytest.mark.parametrize(
-    "argv", [["serve", "--log-level", "trace"], ["init", "--log-level", "debug"]]
+    "argv", [["serve", "--log-level", "verbose"], ["init", "--log-level", "debug"]]
 )
 def test_log_level_rejects_unknown_levels_and_init(argv):
     with pytest.raises(SystemExit) as error:
@@ -177,9 +182,43 @@ def test_logging_level_filters_proxy_logs(capsys):
     assert "visible message" in output.err
 
 
-def test_logging_leaves_root_sdk_and_network_loggers_unchanged():
+@pytest.mark.parametrize("level", ["trace", "debug"])
+def test_logging_leaves_root_sdk_and_network_loggers_unchanged(level):
     loggers = [logging.getLogger(name) for name in ("", "musegadget", "httpx", "websockets")]
     before = [(logger.level, logger.propagate, logger.handlers[:]) for logger in loggers]
-    configure_logging("debug")
+    configure_logging(level)
     after = [(logger.level, logger.propagate, logger.handlers[:]) for logger in loggers]
     assert after == before
+
+
+@pytest.mark.parametrize("level,trace_visible", [("trace", True), ("debug", False)])
+def test_trace_is_more_detailed_than_debug(level, trace_visible, capsys):
+    configure_logging(level)
+    logger = logging.getLogger("muse_proxy.http")
+    logger.log(TRACE_LEVEL, "trace payload")
+    logger.debug("debug diagnostic")
+    output = capsys.readouterr()
+    assert (" TRACE muse_proxy.http trace payload" in output.err) is trace_visible
+    assert " DEBUG muse_proxy.http debug diagnostic" in output.err
+
+
+def test_trace_configuration_preserves_one_cli_handler(capsys):
+    configure_logging("trace")
+    configure_logging("trace")
+    logging.getLogger("muse_proxy.http").log(TRACE_LEVEL, "one trace payload")
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.count("one trace payload") == 1
+
+
+def test_trace_level_name_is_registered_for_embedded_logging():
+    assert TRACE_LEVEL < logging.DEBUG
+    assert logging.getLevelName(TRACE_LEVEL) == "TRACE"
+    assert logging.getLevelName("TRACE") == TRACE_LEVEL
+
+
+def test_serve_help_explains_trace_logs_bodies(capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["serve", "--help"])
+    assert error.value.code == 0
+    assert "trace logs request/response bodies" in " ".join(capsys.readouterr().out.split())
