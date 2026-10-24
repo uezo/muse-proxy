@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "muse-proxy"
-version = "0.1.0"
-description = "Access Muse through an OpenAI-compatible text chat API."
+version = "0.1.1"
+description = "Access Muse from any app through an OpenAI-compatible text chat API."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

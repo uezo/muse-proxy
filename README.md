@@ -67,6 +67,8 @@ muse-proxy serve --config proxy.toml
 
 The default listen address is `http://127.0.0.1:8766`. Press Ctrl+C to stop.
 Startup, `GET /health`, and model listing do not connect to Muse; the first conversation request establishes the connection.
+The terminal logs incoming requests, HTTP status and duration, conversation outcomes, and sanitized error codes by default.
+See [logging and client troubleshooting](#logging) when connecting another application.
 
 ### 4. Call the OpenAI-compatible API
 
@@ -327,6 +329,43 @@ See the [accepted, ignored, and rejected fields](docs/reference.md#openai-compat
 <a id="operations"></a>
 
 ## 🛠️ Operations
+
+<a id="logging"></a>
+
+### Logging and client troubleshooting
+
+`serve` logs to stderr at `info` level by default. Each HTTP request has an internal `http_id` for correlating its arrival and completion,
+including rejected requests. Accepted chat requests also log the generated completion `request_id`.
+Logs show the HTTP method, recognized route, response status, duration, and completion or cancellation outcome.
+Failures include a sanitized error code and, when available, the parameter name.
+An unknown route is sanitized instead of logging its raw path.
+
+Enable additional proxy diagnostics with:
+
+```sh
+muse-proxy serve --config proxy.toml --log-level debug
+```
+
+Supported levels are `debug`, `info`, `warning`, `error`, and `critical`.
+Debug mode enables proxy diagnostics while keeping server logs at `info` to avoid WebSocket handshake/header dumps.
+Other levels apply to both proxy and server logs. SDK and network-library debug logging is not enabled.
+Proxy request logs omit message bodies, API keys, authentication headers, query strings, and session IDs.
+**An SSE request can log HTTP 200 and still fail:** inspect the error code and the stream's error frame, not just the HTTP status.
+
+For a third-party client, check these settings and log results:
+
+| Log or symptom | What to check |
+| --- | --- |
+| No incoming-request log at `info` level | The request has not reached this process; check the client URL, listen address, port, and reverse proxy |
+| 404 for an unknown route | Use base URL `http://127.0.0.1:8766/v1` and Chat Completions; the Responses API is unsupported |
+| 401 / `invalid_api_key` | Use the proxy's `api_key`, rather than a Muse token |
+| 404 / `model_not_found` | Set the client's model to the configured alias, `muse` by default |
+| 400 / `invalid_request_error` | Check the logged parameter and the [supported request fields](docs/reference.md#openai-compatible-protocol) |
+| 403 / `origin_rejected`, or `OPTIONS` returns 405 | A browser client is making a cross-origin request; the proxy does not enable CORS or handle preflight requests. Route through the application's backend or a suitable same-origin deployment |
+
+These diagnostics do not change the API's authentication, origin checks, or supported endpoints.
+
+### Runtime and credentials
 
 - **Startup and shutdown** — The CLI runs in the foreground with one worker. Operate one process with one worker.
 - **Request storage** — Pending requests and subscriptions are held in memory. Restart recovery and result lookup by request ID are unavailable.
